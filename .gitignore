@@ -1,0 +1,8 @@
+__pycache__
+.coverage
+.vscode/
+*.egg-info
+build/
+dist/
+site/
+version.py

@@ -1,0 +1,8 @@
+site_name: LeClerc Loom Server
+nav:
+  - Home: index.md
+  - Version History: version_history.md
+theme:
+  name: readthedocs
+  features:
+    - color_mode: auto
