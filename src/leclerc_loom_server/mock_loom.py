@@ -30,6 +30,7 @@ class MockLoom(BaseMockLoom):
 
         self.desired_shaft_word: int = 0
         self.shed_open: bool = False
+        self.test_mode: bool = False
         self.time_out_next_pick: bool = False
         self.timed_out: bool = False
 
@@ -48,6 +49,7 @@ class MockLoom(BaseMockLoom):
             return
         cmd = read_bytes[1:2].decode("ascii")
         data = read_bytes[2:-1]
+        self.test_mode = False
         match cmd:
             case "I":
                 # Shafts for next pick
@@ -58,9 +60,24 @@ class MockLoom(BaseMockLoom):
                     self.log.warning(f"MockLoom: ignoring command: {read_bytes!r}; moving")
                     return
                 self.move_task = asyncio.create_task(self.move(self.desired_shaft_word))
-            case "S":
-                # Status
+            case "R":
+                # Release solenoids.
+                # A no-op if not moving.
+                # If moving, cancel motion and reset self.moving and self.timed_out,
+                # but leave self.shed_open alone.
+                if self.moving:  # type: ignore[has-type]
+                    return
+                self.move_task.cancel()
+                self.moving = False
+                self.timed_out = False
+            case "Q":
+                # Get status.
                 await self.report_status()
+            case "T":
+                # Enter test mode.
+                self.test_mode = True
+            case _:
+                self.log.warning(f"Ignoring unrecognized command {read_bytes!r}")
 
     async def move(self, shaft_word: int) -> None:
         """Move shafts to the desired state.
