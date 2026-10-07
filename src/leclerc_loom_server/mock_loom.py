@@ -49,6 +49,8 @@ class MockLoom(BaseMockLoom):
             return
         cmd = read_bytes[1:2].decode("ascii")
         data = read_bytes[2:-1]
+        if self.test_mode:
+            self.log.info("Leaving test mode")
         self.test_mode = False
         match cmd:
             case "I":
@@ -74,8 +76,9 @@ class MockLoom(BaseMockLoom):
                 # Get status.
                 await self.report_status()
             case "T":
-                # Enter test mode.
+                # Enter test mode. Note: any command exits test mode.
                 self.test_mode = True
+                self.log.info("Entering test mode")
             case _:
                 self.log.warning(f"Ignoring unrecognized command {read_bytes!r}")
 
