@@ -30,7 +30,7 @@ class LoomServer(BaseLoomServer):
     loom_reports_motion = True
     loom_reports_direction = False
     mock_loom_type = MockLoom
-    # LeClerc looms do not offer a physical direction control.
+    # Leclerc looms do not offer a physical direction control.
     # Indicate this with supports_full_direction_control=True
     # and loom_reports_direction=False.
     supports_full_direction_control = True
@@ -70,7 +70,7 @@ class LoomServer(BaseLoomServer):
                 # Ready for next pick.
                 self.shaft_state = ShaftStateEnum.DONE
             case b"T":
-                self.shaft_state = ShaftStateEnum.NEED_RESTART
+                self.shaft_state = ShaftStateEnum.AWAITING_RESUME
             case b"S":
                 # reply_data is a single byte with these bits:
                 # * 0: are solenoids engaged?
