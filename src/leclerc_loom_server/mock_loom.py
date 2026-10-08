@@ -3,12 +3,13 @@ __all__ = ["MockLoom"]
 import asyncio
 
 from base_loom_server.base_mock_loom import BaseMockLoom
+from base_loom_server.utils import create_done_future
 
 from leclerc_loom_server.utils import shaft_word_from_bytes
 
 
 class MockLoom(BaseMockLoom):
-    """Simulate a LeClerc ES dobby loom.
+    """Simulate a Leclerc dobby loom.
 
     The user controls this loom by:
 
@@ -18,11 +19,12 @@ class MockLoom(BaseMockLoom):
     * Write commands to the command writer.
     """
 
-    first_byte = b"\x1b"  # ASCII <ESC>: the first byte of each command and reply
-    terminator = b"\x0d"  # ASCII <CR>; the last byte of each command and reply
-    shed_open_delay = 0.25  # time for user to open the shed after engaging solenoids
-    shed_close_delay = 0.75  # time for user to close the shed after opening it
-    timeout_delay = 1  # time for timeout after "E"
+    first_byte = b"\x1b"  # ASCII <ESC>: the first byte of each command and reply.
+    terminator = b"\x0d"  # ASCII <CR>; the last byte of each command and reply.
+    shed_close_duration = 0.5  # Duration for user to close the shed after opening it.
+    max_timeout = 10  # Max time after "E" before the loom times out the shed.
+    # 60 seconds is what real looms use, but shorten it for normal use,
+    # and shorten it to almost nothing for unit tests where a timeout is wanted.
 
     def __post_init__(self) -> None:
         if self.num_shafts % 8 != 0:
@@ -31,8 +33,8 @@ class MockLoom(BaseMockLoom):
         self.desired_shaft_word: int = 0
         self.shed_open: bool = False
         self.test_mode: bool = False
-        self.time_out_next_pick: bool = False
         self.timed_out: bool = False
+        self.timeout_task = create_done_future()
 
     async def basic_read(self) -> bytes:
         """Read one command to the loom.
@@ -95,27 +97,40 @@ class MockLoom(BaseMockLoom):
         self.shed_open = False
         self.moving = False
 
-        if self.time_out_next_pick:
-            self.time_out_next_pick = False
-            await asyncio.sleep(self.timeout_delay)
+        try:
+            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout))
+            await self.timeout_task
+        except TimeoutError:
             self.timed_out = True
             await self.write_reply(b"T")
             return
+        except asyncio.CancelledError:
+            # Normal operation; oob command n was received in time.
+            pass
 
+        self.shaft_word = shaft_word
         self.moving = True
-        await asyncio.sleep(self.shed_open_delay)
         self.shed_open = True
-        await asyncio.sleep(self.shed_close_delay)
+        await asyncio.sleep(self.shed_close_duration)
         self.shed_open = False
         self.moving = False
         self.pick_wanted = True
-        self.shaft_word = shaft_word
         await self.write_reply(b"C")
+
+    async def oob_command_n(self, cmd: str) -> None:  # noqa: ARG002
+        """Open the shed, if moving.
+
+        If the solenoids are engaged, interrupt the timeout timer.
+        Otherwise a no-op.
+        """
+        if self.verbose:
+            self.log.info(f"{self}: oob next pick (open shed if solenoids engaged)")
+        self.timeout_task.cancel()
 
     async def report_direction(self) -> None:
         """Report direction (weave/unweave).
 
-        LeClerc looms do not know anything about direction,
+        Leclerc looms do not know anything about direction,
         so just log the request.
         """
         if self.verbose:
@@ -157,7 +172,7 @@ class MockLoom(BaseMockLoom):
     async def report_shafts(self) -> None:
         """Report motion state.
 
-        LeClerc looms do not report shafts, so just log if verbose.
+        Leclerc looms do not report shafts, so just log if verbose.
         """
         if self.verbose:
             self.log.info(f"{self}.shaft_word={self.shaft_word}")
