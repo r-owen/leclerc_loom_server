@@ -18,8 +18,8 @@ class MockLoom(BaseMockLoom):
     * Write commands to the command writer.
     """
 
-    first_byte = b"\x1b"  # ASCII <ESC>: the first char of each command and reply
-    terminator = b"\x0d"  # ASCII <CR>
+    first_byte = b"\x1b"  # ASCII <ESC>: the first byte of each command and reply
+    terminator = b"\x0d"  # ASCII <CR>; the last byte of each command and reply
     shed_open_delay = 0.25  # time for user to open the shed after engaging solenoids
     shed_close_delay = 0.75  # time for user to close the shed after opening it
     timeout_delay = 1  # time for timeout after "E"
@@ -47,22 +47,22 @@ class MockLoom(BaseMockLoom):
         if read_bytes[0:1] != self.first_byte:
             self.log.warning(f"MockLoom: ignoring command {read_bytes!r}; first byte not {self.first_byte!r}")
             return
-        cmd = read_bytes[1:2].decode("ascii")
-        data = read_bytes[2:-1]
+        cmd = read_bytes[1:2]  # skip first_byte.
+        data = read_bytes[2:-1]  # skip terminator.
         if self.test_mode:
             self.log.info("Leaving test mode")
         self.test_mode = False
         match cmd:
-            case "I":
+            case b"I":
                 # Shafts for next pick
                 self.desired_shaft_word = shaft_word_from_bytes(data)
-            case "E":
+            case b"E":
                 # Energize the solenoids
                 if self.moving:  # type: ignore[has-type]
                     self.log.warning(f"MockLoom: ignoring command: {read_bytes!r}; moving")
                     return
                 self.move_task = asyncio.create_task(self.move(self.desired_shaft_word))
-            case "R":
+            case b"R":
                 # Release solenoids.
                 # A no-op if not moving.
                 # If moving, cancel motion and reset self.moving and self.timed_out,
@@ -72,15 +72,15 @@ class MockLoom(BaseMockLoom):
                 self.move_task.cancel()
                 self.moving = False
                 self.timed_out = False
-            case "Q":
+            case b"Q":
                 # Get status.
                 await self.report_status()
-            case "T":
+            case b"T":
                 # Enter test mode. Note: any command exits test mode.
                 self.test_mode = True
                 self.log.info("Entering test mode")
             case _:
-                self.log.warning(f"Ignoring unrecognized command {read_bytes!r}")
+                self.log.warning(f"Ignoring unrecognized command {cmd!r} in {read_bytes!r}")
 
     async def move(self, shaft_word: int) -> None:
         """Move shafts to the desired state.
@@ -102,9 +102,9 @@ class MockLoom(BaseMockLoom):
             await self.write_reply(b"T")
             return
 
+        self.moving = True
         await asyncio.sleep(self.shed_open_delay)
         self.shed_open = True
-        self.moving = True
         await asyncio.sleep(self.shed_close_delay)
         self.shed_open = False
         self.moving = False
@@ -135,15 +135,15 @@ class MockLoom(BaseMockLoom):
         """Report status.
 
         Sx where S is a bitmask with bits:
-        * 0 are the solenoids engaged (self.moving True)?
+        * 0 are the solenoids engaged. Equals self.moving.
         * 1: switch 2 (shed open) status? Equals self.shed_open.
-        * 2: switch 1 (shed closed) status? Equals not self.moving.
+        * 2: switch 1 (shed closed) status? Approx. equals not self.shed_open.
         * 3: did the last cycle time out? Equals self.timed_out.
         """
         status_word = 0
         status_word |= bool(self.moving)
         status_word |= bool(self.shed_open) << 1
-        status_word |= bool(not self.moving) << 2
+        status_word |= bool(not self.shed_open) << 2
         status_word |= bool(self.timed_out) << 3
         await self.write_reply(b"S" + status_word.to_bytes(length=1))
 
