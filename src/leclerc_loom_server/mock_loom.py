@@ -1,6 +1,7 @@
 __all__ = ["MockLoom"]
 
 import asyncio
+from typing import Any
 
 from base_loom_server.base_mock_loom import BaseMockLoom
 from base_loom_server.utils import create_done_future
@@ -31,7 +32,8 @@ class MockLoom(BaseMockLoom):
             raise ValueError(f"num_shafts={self.num_shafts} must be a multiple of 8")
 
         self.desired_shaft_word: int = 0
-        self.shed_open: bool = False
+        self.moving = False
+        self.shed_closed: bool = True
         self.test_mode: bool = False
         self.timed_out: bool = False
         self.timeout_task = create_done_future()
@@ -43,6 +45,11 @@ class MockLoom(BaseMockLoom):
         """
         assert self.reader is not None  # make mypy happy
         return await self.reader.readuntil(self.terminator)
+
+    async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
+        """Shut down the mock loom."""
+        self.timeout_task.cancel()
+        await super().close(**kwargs)
 
     async def handle_read_bytes(self, read_bytes: bytes) -> None:
         """Handle one command from the web server."""
@@ -68,7 +75,7 @@ class MockLoom(BaseMockLoom):
                 # Release solenoids.
                 # A no-op if not moving.
                 # If moving, cancel motion and reset self.moving and self.timed_out,
-                # but leave self.shed_open alone.
+                # but leave self.shed_closed alone.
                 if self.moving:  # type: ignore[has-type]
                     return
                 self.move_task.cancel()
@@ -93,26 +100,27 @@ class MockLoom(BaseMockLoom):
             self.log.warning("Request to move ignored; already moving.")
             return
 
+        self.moving = True
+        self.pick_wanted = False
+        self.shed_closed = False
         self.timed_out = False
-        self.shed_open = False
-        self.moving = False
 
         try:
             self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout))
             await self.timeout_task
-        except TimeoutError:
             self.timed_out = True
-            await self.write_reply(b"T")
-            return
         except asyncio.CancelledError:
             # Normal operation; oob command n was received in time.
             pass
 
+        if self.timed_out:
+            await self.write_reply(b"T")
+            return
+
         self.shaft_word = shaft_word
-        self.moving = True
-        self.shed_open = True
+        self.shed_closed = False
         await asyncio.sleep(self.shed_close_duration)
-        self.shed_open = False
+        self.shed_closed = True
         self.moving = False
         self.pick_wanted = True
         await self.write_reply(b"C")
@@ -124,7 +132,10 @@ class MockLoom(BaseMockLoom):
         Otherwise a no-op.
         """
         if self.verbose:
-            self.log.info(f"{self}: oob next pick (open shed if solenoids engaged)")
+            if self.timeout_task.done():
+                self.log.info(f"{self}: oob next pick; ignored because not moving")
+            else:
+                self.log.info(f"{self}: oob next pick; start closing shed")
         self.timeout_task.cancel()
 
     async def report_direction(self) -> None:
@@ -149,16 +160,17 @@ class MockLoom(BaseMockLoom):
     async def report_status(self) -> None:
         """Report status.
 
-        Sx where S is a bitmask with bits:
+        Sx where x is a bitmask with bits:
         * 0 are the solenoids engaged. Equals self.moving.
-        * 1: switch 2 (shed open) status? Equals self.shed_open.
-        * 2: switch 1 (shed closed) status? Approx. equals not self.shed_open.
+        * 1: shed partially open (switch #1)? Always 0.
+        * 2: shed fully closed (switch #2)? Equals self.shed_closed.
         * 3: did the last cycle time out? Equals self.timed_out.
         """
+        if self.verbose:
+            self.log.info(f"{self}.report_status: {self.moving=}, {self.shed_closed=}, {self.timed_out=}")
         status_word = 0
         status_word |= bool(self.moving)
-        status_word |= bool(self.shed_open) << 1
-        status_word |= bool(not self.shed_open) << 2
+        status_word |= bool(self.shed_closed) << 2
         status_word |= bool(self.timed_out) << 3
         await self.write_reply(b"S" + status_word.to_bytes(length=1))
 
