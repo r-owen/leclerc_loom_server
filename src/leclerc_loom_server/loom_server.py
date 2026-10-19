@@ -2,10 +2,11 @@ __all__ = ["LoomServer"]
 
 import asyncio
 import enum
+from types import SimpleNamespace
 from typing import Any, TypeAlias
 
 from base_loom_server.base_loom_server import BaseLoomServer
-from base_loom_server.enums import ShaftStateEnum
+from base_loom_server.enums import RunStateEnum, ShaftStateEnum
 from base_loom_server.utils import create_done_future
 
 from leclerc_loom_server.utils import bytes_from_shaft_word
@@ -49,26 +50,69 @@ class LoomServer(BaseLoomServer):
     # Indicate this with supports_full_direction_control=True
     # and loom_reports_direction=False.
     supports_full_direction_control = True
+    # Supports start and stop commands
+    supports_start_stop = True
     # Interval between status requests when cancelling a shed (seconds)
     status_interval = 0.1
 
     def __post_init__(self) -> None:
         # Used to run wait_shed_closed.
-        self.cancel_shed_task = create_done_future()
+        self.shed_closed_task = create_done_future()
         self.ignore_replies_task = create_done_future()
         # Used to tell wait_shed_closed that the shed is closed.
         self.shed_closed_event = asyncio.Event()
-        self.release_solenoids_when_safe = False
+        # Release the solenoids when the shed closes?
+        # Set true if changing the sequence while running
+        # (e.g. a new pattern, new mode, jumping to a pick...).
+        self.release_on_close = False
 
     async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
         """Override close to also cancel local tasks."""
         self.ignore_replies_task.cancel()
-        self.cancel_shed_task.cancel()
+        self.shed_closed_task.cancel()
         await super().close(**kwargs)
+
+    async def cmd_start(
+        self,
+        command: SimpleNamespace,
+    ) -> None:
+        """Handle the start command, which has no parameters."""
+        await super().cmd_start(command=command)
+        if self.run_state != RunStateEnum.RUNNING and self.shed_closed_task.done():  #  type: ignore[has-type]
+            self.run_state = RunStateEnum.STARTING
+            await self.report_run_state()
+            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+
+    async def cmd_stop(
+        self,
+        command: SimpleNamespace,
+    ) -> None:
+        """Handle the stop command, which has no parameters."""
+        await super().cmd_stop(command=command)
+        if self.run_state != RunStateEnum.STOPPED and self.shed_closed_task.done():
+            self.run_state = RunStateEnum.STOPPING
+            await self.report_run_state()
+            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def get_initial_loom_state(self) -> None:
         """Get initial loom state."""
-        self.cancel_shed_task = asyncio.create_task(self.wait_shed_closed(aborting=False))
+        if self.shed_closed_task.done():
+            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+
+    async def handle_change(
+        self,
+        command: SimpleNamespace,  # noqa: ARG002
+    ) -> None:
+        """Handle a discontiguous change to the weaving or threading.
+
+        This is any of: a new pattern, a different mode, or jumping
+        to a new pick or end.
+        """
+        self.release_on_close = True
+        await self.restore_previous_state()
+        if self.shed_closed_task.done():
+            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+        self.record_previous_state()
 
     async def handle_loom_reply(self, reply_bytes: bytes) -> None:
         """Process one reply_bytes from the loom."""
@@ -88,6 +132,7 @@ class LoomServer(BaseLoomServer):
         reply_data = reply_bytes[2:-1]  # skip terminator.
         new_shaft_state: ShaftStateEnum = self.shaft_state  # type: ignore[has-type]
         shed_closed = False  # False means open or unknown
+        initial_run_state = self.run_state
         match reply_code:
             case b"?":
                 # System has started up; ignore this as we don't know if the shed is closed.
@@ -100,6 +145,8 @@ class LoomServer(BaseLoomServer):
                 # Cycle timed out. Stop weaving.
                 # We don't know if the shed is closed, so assume it is not.
                 new_shaft_state = ShaftStateEnum.TIMED_OUT
+                if self.run_state != RunStateEnum.STOPPED:
+                    self.run_state = RunStateEnum.STOPPING
             case b"S":
                 # Status. Ignore the SHED_OPEN bit, since we don't have any use for it.
                 status_word = reply_data[0]
@@ -107,12 +154,14 @@ class LoomServer(BaseLoomServer):
                 shed_closed = status_word & StatusBits.SHED_CLOSED > 0
                 is_timed_out = status_word & StatusBits.TIMED_OUT > 0
                 if is_energized:
-                    # Solenoids are energized. Assume we are weaving
-                    # (abort is handled later).
+                    # Solenoids are energized.
+                    # Note: if the solenoids are energized and the shed is closed,
+                    # this indicates the "shed mostly open" switch has not been seen,
+                    # and the timeout timer is still running.
                     new_shaft_state = (
-                        ShaftStateEnum.WAITING_FOR_CLOSE
-                        if self.release_solenoids_when_safe
-                        else ShaftStateEnum.MOVING
+                        ShaftStateEnum.MOVING
+                        if self.run_state == RunStateEnum.RUNNING
+                        else ShaftStateEnum.WAITING_FOR_CLOSE
                     )
                 elif shed_closed:
                     # Solenoids are not energized and shed is closed.
@@ -125,22 +174,33 @@ class LoomServer(BaseLoomServer):
                 self.log.warning(f"Ignoring unrecognized reply from loom: {reply_bytes!r}")
                 return
 
-        if shed_closed:
-            if not self.cancel_shed_task.done():
-                self.ignore_replies_task = asyncio.create_task(asyncio.sleep(self.status_interval))
-            self.shed_closed_event.set()
-            if self.release_solenoids_when_safe:
-                self.release_solenoids_when_safe = False
-                await self.write_to_loom(b"R")
-
         if new_shaft_state != self.shaft_state:  # type: ignore[has-type]
             self.shaft_state = new_shaft_state
             await self.report_shaft_state()
 
-        if self.shaft_state == ShaftStateEnum.DONE:
-            await self.handle_next_pick_request()
+        if shed_closed:
+            if not self.shed_closed_task.done():
+                # Still polling for status, so start the ignore_replies_task
+                # to handle potential race conditions.
+                self.ignore_replies_task = asyncio.create_task(asyncio.sleep(self.status_interval))
+            self.shed_closed_event.set()
+            if self.release_on_close or self.run_state in {RunStateEnum.STOPPING, RunStateEnum.STOPPED}:
+                await self.write_to_loom(b"R")
+                if self.run_state == RunStateEnum.STOPPING:
+                    self.run_state = RunStateEnum.STOPPED
+                self.release_on_close = False
+                if self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
+                    self.shaft_state = ShaftStateEnum.DONE
 
-    async def wait_shed_closed(self, *, aborting: bool) -> None:
+            if self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
+                await self.handle_next_pick_request()
+                if self.run_state == RunStateEnum.STARTING:
+                    self.run_state = RunStateEnum.RUNNING
+
+        if self.run_state != initial_run_state:
+            await self.report_run_state()
+
+    async def wait_shed_closed(self) -> None:
         """Wait for the shed to close by polling status.
 
         This is used when connecting to the loom, and when changing patterns
@@ -150,15 +210,15 @@ class LoomServer(BaseLoomServer):
 
         Run using:
 
-            self.cancel_shed_task = asyncio.create_task(
-                self.wait_shed_closed(aborting=...)
-            )
 
-        so handle_loom_reply can reliably tell when this is running.
+            if not self.shed_closed_task.done():
+                self.shed_closed_task = asyncio.create_task(
+                    self.wait_shed_closed(aborting=...)
+                )
+
+        Using shed_closed_task means handle_loom_reply can reliably
+        tell when this is running.
         """
-        if aborting:
-            self.release_solenoids_when_safe = True
-
         self.shed_closed_event.clear()
         while True:
             await self.write_to_loom(b"Q")
