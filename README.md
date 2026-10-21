@@ -1,4 +1,4 @@
-# Web server that controls a LeClerc WeaveBird dobby loom
+# Web server that controls a Leclerc WeaveBird dobby loom
 
 This server is intended to allow you to control your loom from any phone, tablet or other device that has wifi and a web browser.
 
