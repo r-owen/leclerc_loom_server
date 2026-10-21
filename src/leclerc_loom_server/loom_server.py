@@ -65,6 +65,8 @@ class LoomServer(BaseLoomServer):
         # Set true if changing the sequence while running
         # (e.g. a new pattern, new mode, jumping to a pick...).
         self.release_on_close = False
+        # Set true during a weave cycle.
+        self.in_cycle = False
 
     async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
         """Override close to also cancel local tasks."""
@@ -112,7 +114,6 @@ class LoomServer(BaseLoomServer):
         await self.restore_previous_state()
         if self.shed_closed_task.done():
             self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
-        self.record_previous_state()
 
     async def handle_loom_reply(self, reply_bytes: bytes) -> None:
         """Process one reply_bytes from the loom."""
@@ -133,20 +134,27 @@ class LoomServer(BaseLoomServer):
         new_shaft_state: ShaftStateEnum = self.shaft_state  # type: ignore[has-type]
         shed_closed = False  # False means open or unknown
         initial_run_state = self.run_state
+        cycle_done = False
         match reply_code:
             case b"?":
                 # System has started up; ignore this as we don't know if the shed is closed.
                 pass
             case b"C":
                 # Cycle complete. The shed is closed and we are ready for the next pick.
+                # Clear saveed state, as we don't need or want to undo.
                 shed_closed = True
+                cycle_done = True
                 new_shaft_state = ShaftStateEnum.DONE
+                self.previous_state = None
+                self.in_cycle = False
             case b"T":
-                # Cycle timed out. Stop weaving.
+                # Cycle timed out. Stop weaving and restore previous state.
                 # We don't know if the shed is closed, so assume it is not.
                 new_shaft_state = ShaftStateEnum.TIMED_OUT
                 if self.run_state != RunStateEnum.STOPPED:
                     self.run_state = RunStateEnum.STOPPING
+                self.in_cycle = False
+                await self.restore_previous_state()
             case b"S":
                 # Status. Ignore the SHED_OPEN bit, since we don't have any use for it.
                 status_word = reply_data[0]
@@ -184,15 +192,21 @@ class LoomServer(BaseLoomServer):
                 # to handle potential race conditions.
                 self.ignore_replies_task = asyncio.create_task(asyncio.sleep(self.status_interval))
             self.shed_closed_event.set()
+
+            # Release the solenoids and abort the cycle, if wanted.
             if self.release_on_close or self.run_state in {RunStateEnum.STOPPING, RunStateEnum.STOPPED}:
+                self.in_cycle = False
                 await self.write_to_loom(b"R")
                 if self.run_state == RunStateEnum.STOPPING:
                     self.run_state = RunStateEnum.STOPPED
                 self.release_on_close = False
-                if self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
-                    self.shaft_state = ShaftStateEnum.DONE
 
-            if self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
+            # Send the next pick, if wanted.
+            if self.in_cycle and not cycle_done:
+                # Ignore this shed_closed because it's not end-of-cycle:
+                # the weaver has yet to open the shed.
+                pass
+            elif self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
                 await self.handle_next_pick_request()
                 if self.run_state == RunStateEnum.STARTING:
                     self.run_state = RunStateEnum.RUNNING
@@ -230,11 +244,15 @@ class LoomServer(BaseLoomServer):
                 pass
 
     async def write_shafts_to_loom(self, shaft_word: int) -> None:
-        """Send a shaft_word to the loom."""
+        """Send a shaft_word to the loom and activate solenoids.
+
+        Warning: the shed must be closed.
+        """
         shaft_bytes = bytes_from_shaft_word(shaft_word=shaft_word)
         await self.write_to_loom(b"I" + shaft_bytes)
         self.shaft_word = shaft_word
         await self.write_to_loom(b"E")
+        self.in_cycle = True
         self.shaft_state = ShaftStateEnum.READY
 
     async def write_to_loom(self, data: bytes) -> None:
