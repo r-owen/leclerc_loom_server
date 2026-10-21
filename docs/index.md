@@ -1,6 +1,6 @@
-# LeClerc Web Server
+# Leclerc Web Server
 
-Software that allows you to control a LeClerc dobby loom from any modern web browser, e.g. on a phone or tablet.
+Software that allows you to control a Leclerc dobby loom from any modern web browser, e.g. on a phone or tablet.
 
 For more information, read the [main documentation](https://r-owen.github.io/base_loom_server/).
 
@@ -14,4 +14,4 @@ For more information, read the [main documentation](https://r-owen.github.io/bas
 
 ## Acknowledgements
 
-Thanks to Francois Brassard from LeClerc for providing the API and helpful clarification.
+Thanks to Francois Brassard from Leclerc for providing the API and helpful clarification.
