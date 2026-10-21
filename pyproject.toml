@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "leclerc_loom_server"
 dynamic = ["version"]
-description = "Web server that drives a LeClerc dobby loom"
+description = "Web server that drives a Leclerc dobby loom"
 readme = "README.md"
 dependencies = [
   # Warning: base_loom_server appears twice
