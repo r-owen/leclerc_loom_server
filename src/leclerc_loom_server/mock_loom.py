@@ -32,11 +32,13 @@ class MockLoom(BaseMockLoom):
             raise ValueError(f"num_shafts={self.num_shafts} must be a multiple of 8")
 
         self.desired_shaft_word: int = 0
-        self.moving = False
         self.shed_closed: bool = True
         self.test_mode: bool = False
         self.timed_out: bool = False
+        # Timeout for starting a weave cycle.
         self.timeout_task = create_done_future()
+        # Delay for finishing a weave cycle after the shed is open.
+        self.close_shed_task = create_done_future()
 
     async def basic_read(self) -> bytes:
         """Read one command to the loom.
@@ -49,6 +51,7 @@ class MockLoom(BaseMockLoom):
     async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
         """Shut down the mock loom."""
         self.timeout_task.cancel()
+        self.close_shed_task.cancel()
         await super().close(**kwargs)
 
     async def handle_read_bytes(self, read_bytes: bytes) -> None:
@@ -67,19 +70,14 @@ class MockLoom(BaseMockLoom):
                 self.desired_shaft_word = shaft_word_from_bytes(data)
             case b"E":
                 # Energize the solenoids
-                if self.moving:  # type: ignore[has-type]
-                    self.log.warning(f"MockLoom: ignoring command: {read_bytes!r}; moving")
-                    return
                 self.move_task = asyncio.create_task(self.move(self.desired_shaft_word))
             case b"R":
-                # Release solenoids.
-                # A no-op if not moving.
-                # If moving, cancel motion and reset self.moving and self.timed_out,
-                # but leave self.shed_closed alone.
-                if self.moving:  # type: ignore[has-type]
-                    return
-                self.move_task.cancel()
-                self.moving = False
+                # Release solenoids (if active) and reset self.timed_out.
+                # If the shed is closing as part of a normal cycle, that continues.
+                if not self.shed_closed:
+                    self.log.warning("Solenoids released while shed not closed.")
+                if self.solenoids_energized:
+                    self.timeout_task.cancel()
                 self.timed_out = False
             case b"Q":
                 # Get status.
@@ -91,23 +89,40 @@ class MockLoom(BaseMockLoom):
             case _:
                 self.log.warning(f"Ignoring unrecognized command {cmd!r} in {read_bytes!r}")
 
+    @property
+    def solenoids_energized(self) -> bool:
+        """Return True if the solenoids are energized (timeout timer running)."""
+        return not self.timeout_task.done()
+
+    @property
+    def in_cycle(self) -> bool:
+        """Are we in a weaving cycle?"""
+        return not self.move_task.done()
+
     async def move(self, shaft_word: int) -> None:
-        """Move shafts to the desired state.
+        """Move shafts to the desired state. Triggered by the "E" command.
 
-        Triggered by the "E" command.
+        This implementation entirely replaces that in the base class.
         """
-        if self.moving:  # type: ignore[has-type]
-            self.log.warning("Request to move ignored; already moving.")
+        if self.solenoids_energized:
+            self.log.error("Ignore invalid request to energize solenoids: already energized.")
             return
+        if not self.shed_closed:
+            self.log.error("Solenoids energized while shed not closed.")
 
-        self.moving = True
-        self.pick_wanted = False
-        self.shed_closed = False
+        self.shaft_word = shaft_word
         self.timed_out = False
-
+        # Assume the user opens the shed about halfway through
+        # the full timeout. That gives us the useful simulation
+        # that the shed is not opened immediately.
         try:
-            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout))
+            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout / 2))
             await self.timeout_task
+            self.shed_closed = False
+            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout / 2))
+            await self.timeout_task
+            # In normal operation the timeout task is canceled by oob_command_n.
+            # If that does not occur, fail the move by setting timed_out.
             self.timed_out = True
         except asyncio.CancelledError:
             # Normal operation; oob command n was received in time.
@@ -117,26 +132,30 @@ class MockLoom(BaseMockLoom):
             await self.write_reply(b"T")
             return
 
-        self.shaft_word = shaft_word
-        self.shed_closed = False
-        await asyncio.sleep(self.shed_close_duration)
+        # Wait for the shed to close. If canceled, this happens early.
+        try:
+            self.shed_close_task = asyncio.sleep(self.shed_close_duration)
+            await self.shed_close_task
+        except asyncio.CancelledError:
+            # Acceptable but not normal.
+            self.log.info("Shed closed early")
         self.shed_closed = True
-        self.moving = False
-        self.pick_wanted = True
         await self.write_reply(b"C")
 
     async def oob_command_n(self, cmd: str) -> None:  # noqa: ARG002
-        """Open the shed, if moving.
+        """If solenoids are engaged (timeout timer running), stop the timeout timer.
 
-        If the solenoids are engaged, interrupt the timeout timer.
-        Otherwise a no-op.
+        Otherwise close the shed immediately (short-circuiting the normal close timer).
         """
-        if self.verbose:
-            if self.timeout_task.done():
-                self.log.info(f"{self}: oob next pick; ignored because not moving")
-            else:
-                self.log.info(f"{self}: oob next pick; start closing shed")
-        self.timeout_task.cancel()
+        if self.solenoids_energized:
+            if self.verbose:
+                self.log.info(f"{self}: oob next pick; open shed and start close shed timer")
+            self.timeout_task.cancel()
+        if not self.close_shed_task.done():
+            if self.verbose:
+                self.log.info(f"{self}: oob next pick; close shed early")
+            self.close_shed_task.cancel()
+        self.shed_closed = True
 
     async def report_direction(self) -> None:
         """Report direction (weave/unweave).
@@ -150,26 +169,30 @@ class MockLoom(BaseMockLoom):
     async def report_motion_state(self) -> None:
         """Report motion state."""
         if self.verbose:
-            self.log.info(f"{self}.moving={self.moving}")
+            self.log.info(f"{self}.moving={self.in_cycle}")
 
     async def report_pick_wanted(self) -> None:
         """Report pick wanted."""
         if self.verbose:
-            self.log.info(f"{self}.pick_wanted={self.pick_wanted}")
+            pick_wanted = self.shed_closed and not self.in_cycle
+            self.log.info(f"{self}.pick_wanted={pick_wanted}")
 
     async def report_status(self) -> None:
         """Report status.
 
         Sx where x is a bitmask with bits:
-        * 0 are the solenoids engaged. Equals self.moving.
+        * 0 are the solenoids engaged?
         * 1: shed partially open (switch #1)? Always 0.
         * 2: shed fully closed (switch #2)? Equals self.shed_closed.
         * 3: did the last cycle time out? Equals self.timed_out.
         """
         if self.verbose:
-            self.log.info(f"{self}.report_status: {self.moving=}, {self.shed_closed=}, {self.timed_out=}")
+            self.log.info(
+                f"{self}.report_status: {self.in_cycle=}, {self.solenoids_energized=}, "
+                f"{self.shed_closed=}, {self.timed_out=}"
+            )
         status_word = 0
-        status_word |= bool(self.moving)
+        status_word |= bool(self.solenoids_energized)
         status_word |= bool(self.shed_closed) << 2
         status_word |= bool(self.timed_out) << 3
         await self.write_reply(b"S" + status_word.to_bytes(length=1))
