@@ -1,4 +1,4 @@
-site_name: LeClerc Loom Server
+site_name: Leclerc Loom Server
 nav:
   - Home: index.md
   - Version History: version_history.md
