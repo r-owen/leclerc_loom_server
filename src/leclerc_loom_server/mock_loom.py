@@ -38,7 +38,7 @@ class MockLoom(BaseMockLoom):
         # Timeout for starting a weave cycle.
         self.timeout_task = create_done_future()
         # Delay for finishing a weave cycle after the shed is open.
-        self.close_shed_task = create_done_future()
+        self.shed_close_task = create_done_future()
 
     async def basic_read(self) -> bytes:
         """Read one command to the loom.
@@ -51,7 +51,7 @@ class MockLoom(BaseMockLoom):
     async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
         """Shut down the mock loom."""
         self.timeout_task.cancel()
-        self.close_shed_task.cancel()
+        self.shed_close_task.cancel()
         await super().close(**kwargs)
 
     async def handle_read_bytes(self, read_bytes: bytes) -> None:
@@ -112,14 +112,9 @@ class MockLoom(BaseMockLoom):
 
         self.shaft_word = shaft_word
         self.timed_out = False
-        # Assume the user opens the shed about halfway through
-        # the full timeout. That gives us the useful simulation
-        # that the shed is not opened immediately.
         try:
-            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout / 2))
-            await self.timeout_task
             self.shed_closed = False
-            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout / 2))
+            self.timeout_task = asyncio.create_task(asyncio.sleep(self.max_timeout))
             await self.timeout_task
             # In normal operation the timeout task is canceled by oob_command_n.
             # If that does not occur, fail the move by setting timed_out.
@@ -134,11 +129,11 @@ class MockLoom(BaseMockLoom):
 
         # Wait for the shed to close. If canceled, this happens early.
         try:
-            self.shed_close_task = asyncio.sleep(self.shed_close_duration)
+            self.shed_close_task = asyncio.create_task(asyncio.sleep(self.shed_close_duration))
             await self.shed_close_task
         except asyncio.CancelledError:
             # Acceptable but not normal.
-            self.log.info("Shed closed early")
+            self.log.info(f"{self}: shed closed early")
         self.shed_closed = True
         await self.write_reply(b"C")
 
@@ -148,14 +143,17 @@ class MockLoom(BaseMockLoom):
         Otherwise close the shed immediately (short-circuiting the normal close timer).
         """
         if self.solenoids_energized:
+            # Normal cycle; simulate opening the shed by canceling
+            # the timeout timer
             if self.verbose:
                 self.log.info(f"{self}: oob next pick; open shed and start close shed timer")
             self.timeout_task.cancel()
-        if not self.close_shed_task.done():
+        else:
+            # Abort the cycle and make sure the shed is closed.
             if self.verbose:
-                self.log.info(f"{self}: oob next pick; close shed early")
-            self.close_shed_task.cancel()
-        self.shed_closed = True
+                self.log.info(f"{self}: oob next pick; closing the shed early")
+            self.shed_close_task.cancel()
+            self.shed_closed = True
 
     async def report_direction(self) -> None:
         """Report direction (weave/unweave).
