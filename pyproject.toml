@@ -9,7 +9,6 @@ build-backend = "setuptools.build_meta"
 name = "leclerc_loom_server"
 dynamic = ["version"]
 description = "Web server that drives a Leclerc dobby loom"
-readme = "README.md"
 dependencies = [
   # Warning: base_loom_server appears twice
   "base_loom_server >= 1.0",
@@ -19,9 +18,11 @@ authors = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+license = "MIT"
+license-files = ["LICENSE.txt"]
+readme = "ReadMe.md"
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
