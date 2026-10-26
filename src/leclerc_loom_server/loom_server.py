@@ -161,23 +161,17 @@ class LoomServer(BaseLoomServer):
                 status_word = reply_data[0]
                 shed_closed = status_word & StatusBits.SHED_CLOSED > 0
                 is_timed_out = status_word & StatusBits.TIMED_OUT > 0
-                if is_timed_out:
-                    new_shaft_state = ShaftStateEnum.TIMED_OUT
-                elif self.in_cycle:
-                    new_shaft_state = ShaftStateEnum.RUNNING
+                if self.in_cycle:
+                    new_shaft_state = ShaftStateEnum.TIMED_OUT if is_timed_out else ShaftStateEnum.RUNNING
                 elif shed_closed:
                     new_shaft_state = ShaftStateEnum.CLOSED
                 else:
-                    new_shaft_state = ShaftStateEnum.UNKNOWN
+                    new_shaft_state = ShaftStateEnum.WAITING_FOR_CLOSE
                 if is_timed_out and shed_closed:
                     cycle_done = True
             case _:
                 self.log.warning(f"Ignoring unrecognized reply from loom: {reply_bytes!r}")
                 return
-
-        if new_shaft_state != self.shaft_state:  # type: ignore[has-type]
-            self.shaft_state = new_shaft_state
-            await self.report_shaft_state()
 
         if shed_closed:
             if not self.wait_shed_closed_task.done():
@@ -203,6 +197,10 @@ class LoomServer(BaseLoomServer):
                 await self.handle_next_pick_request()
                 if self.run_state == RunStateEnum.STARTING:
                     self.run_state = RunStateEnum.RUNNING
+
+        if new_shaft_state != self.shaft_state:  # type: ignore[has-type]
+            self.shaft_state = new_shaft_state
+            await self.report_shaft_state()
 
         if self.run_state != initial_run_state:
             await self.report_run_state()
