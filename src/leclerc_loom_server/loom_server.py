@@ -56,11 +56,10 @@ class LoomServer(BaseLoomServer):
     status_interval = 0.1
 
     def __post_init__(self) -> None:
-        # Used to run wait_shed_closed.
-        self.shed_closed_task = create_done_future()
         self.ignore_replies_task = create_done_future()
         # Used to tell wait_shed_closed that the shed is closed.
         self.shed_closed_event = asyncio.Event()
+        self.wait_shed_closed_task = create_done_future()
         # Release the solenoids when the shed closes?
         # Set true if changing the sequence while running
         # (e.g. a new pattern, new mode, jumping to a pick...).
@@ -71,7 +70,7 @@ class LoomServer(BaseLoomServer):
     async def close(self, **kwargs: Any) -> None:  # noqa: ANN401
         """Override close to also cancel local tasks."""
         self.ignore_replies_task.cancel()
-        self.shed_closed_task.cancel()
+        self.wait_shed_closed_task.cancel()
         await super().close(**kwargs)
 
     async def cmd_start(
@@ -80,10 +79,10 @@ class LoomServer(BaseLoomServer):
     ) -> None:
         """Handle the start command, which has no parameters."""
         await super().cmd_start(command=command)
-        if self.run_state != RunStateEnum.RUNNING and self.shed_closed_task.done():  #  type: ignore[has-type]
+        if self.run_state != RunStateEnum.RUNNING and self.wait_shed_closed_task.done():  #  type: ignore[has-type]
             self.run_state = RunStateEnum.STARTING
             await self.report_run_state()
-            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+            self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def cmd_stop(
         self,
@@ -91,15 +90,16 @@ class LoomServer(BaseLoomServer):
     ) -> None:
         """Handle the stop command, which has no parameters."""
         await super().cmd_stop(command=command)
-        if self.run_state != RunStateEnum.STOPPED and self.shed_closed_task.done():
+        self.in_cycle = False
+        if self.run_state != RunStateEnum.STOPPED and self.wait_shed_closed_task.done():
             self.run_state = RunStateEnum.STOPPING
             await self.report_run_state()
-            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+            self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def get_initial_loom_state(self) -> None:
         """Get initial loom state."""
-        if self.shed_closed_task.done():
-            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+        if self.wait_shed_closed_task.done():
+            self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def handle_change(
         self,
@@ -112,8 +112,8 @@ class LoomServer(BaseLoomServer):
         """
         self.release_on_close = True
         await self.restore_previous_state()
-        if self.shed_closed_task.done():
-            self.shed_closed_task = asyncio.create_task(self.wait_shed_closed())
+        if self.wait_shed_closed_task.done():
+            self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def handle_loom_reply(self, reply_bytes: bytes) -> None:
         """Process one reply_bytes from the loom."""
@@ -144,7 +144,7 @@ class LoomServer(BaseLoomServer):
                 # Clear saveed state, as we don't need or want to undo.
                 shed_closed = True
                 cycle_done = True
-                new_shaft_state = ShaftStateEnum.DONE
+                new_shaft_state = ShaftStateEnum.RUNNING if self.in_cycle else ShaftStateEnum.CLOSED
                 self.previous_state = None
                 self.in_cycle = False
             case b"T":
@@ -156,28 +156,21 @@ class LoomServer(BaseLoomServer):
                 self.in_cycle = False
                 await self.restore_previous_state()
             case b"S":
-                # Status. Ignore the SHED_OPEN bit, since we don't have any use for it.
+                # Status. Ignore the ENERGIZED and SHED_OPEN bits,
+                # since we don't have any use for them.
                 status_word = reply_data[0]
-                is_energized = status_word & StatusBits.ENERGIZED > 0
                 shed_closed = status_word & StatusBits.SHED_CLOSED > 0
                 is_timed_out = status_word & StatusBits.TIMED_OUT > 0
-                if is_energized:
-                    # Solenoids are energized.
-                    # Note: if the solenoids are energized and the shed is closed,
-                    # this indicates the "shed mostly open" switch has not been seen,
-                    # and the timeout timer is still running.
-                    new_shaft_state = (
-                        ShaftStateEnum.MOVING
-                        if self.run_state == RunStateEnum.RUNNING
-                        else ShaftStateEnum.WAITING_FOR_CLOSE
-                    )
+                if is_timed_out:
+                    new_shaft_state = ShaftStateEnum.TIMED_OUT
+                elif self.in_cycle:
+                    new_shaft_state = ShaftStateEnum.RUNNING
                 elif shed_closed:
-                    # Solenoids are not energized and shed is closed.
-                    new_shaft_state = ShaftStateEnum.TIMED_OUT if is_timed_out else ShaftStateEnum.DONE
+                    new_shaft_state = ShaftStateEnum.CLOSED
                 else:
-                    # Solenoids are not energized, but the shed is open,
-                    # so it is not safe to energize them.
-                    new_shaft_state = ShaftStateEnum.WAITING_FOR_CLOSE
+                    new_shaft_state = ShaftStateEnum.UNKNOWN
+                if is_timed_out and shed_closed:
+                    cycle_done = True
             case _:
                 self.log.warning(f"Ignoring unrecognized reply from loom: {reply_bytes!r}")
                 return
@@ -187,7 +180,7 @@ class LoomServer(BaseLoomServer):
             await self.report_shaft_state()
 
         if shed_closed:
-            if not self.shed_closed_task.done():
+            if not self.wait_shed_closed_task.done():
                 # Still polling for status, so start the ignore_replies_task
                 # to handle potential race conditions.
                 self.ignore_replies_task = asyncio.create_task(asyncio.sleep(self.status_interval))
@@ -213,6 +206,8 @@ class LoomServer(BaseLoomServer):
 
         if self.run_state != initial_run_state:
             await self.report_run_state()
+            if self.run_state == RunStateEnum.STOPPING and self.wait_shed_closed_task.done():
+                self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def wait_shed_closed(self) -> None:
         """Wait for the shed to close by polling status.
@@ -225,12 +220,12 @@ class LoomServer(BaseLoomServer):
         Run using:
 
 
-            if not self.shed_closed_task.done():
-                self.shed_closed_task = asyncio.create_task(
+            if not self.wait_shed_closed_task.done():
+                self.wait_shed_closed_task = asyncio.create_task(
                     self.wait_shed_closed(aborting=...)
                 )
 
-        Using shed_closed_task means handle_loom_reply can reliably
+        Using wait_shed_closed_task means handle_loom_reply can reliably
         tell when this is running.
         """
         self.shed_closed_event.clear()
@@ -253,7 +248,9 @@ class LoomServer(BaseLoomServer):
         self.shaft_word = shaft_word
         await self.write_to_loom(b"E")
         self.in_cycle = True
-        self.shaft_state = ShaftStateEnum.READY
+        if self.shaft_state != ShaftStateEnum.RUNNING:
+            self.shaft_state = ShaftStateEnum.RUNNING
+            await self.report_shaft_state()
 
     async def write_to_loom(self, data: bytes) -> None:
         """Send data to the loom.
