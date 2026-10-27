@@ -163,10 +163,10 @@ class LoomServer(BaseLoomServer):
                 is_timed_out = status_word & StatusBits.TIMED_OUT > 0
                 if self.in_cycle:
                     new_shaft_state = ShaftStateEnum.TIMED_OUT if is_timed_out else ShaftStateEnum.RUNNING
-                elif shed_closed:
-                    new_shaft_state = ShaftStateEnum.CLOSED
                 else:
-                    new_shaft_state = ShaftStateEnum.WAITING_FOR_CLOSE
+                    new_shaft_state = (
+                        ShaftStateEnum.CLOSED if shed_closed else ShaftStateEnum.WAITING_FOR_CLOSE
+                    )
                 if is_timed_out and shed_closed:
                     cycle_done = True
             case _:
