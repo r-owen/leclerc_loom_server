@@ -79,8 +79,8 @@ class LoomServer(BaseLoomServer):
     ) -> None:
         """Handle the start command, which has no parameters."""
         await super().cmd_start(command=command)
-        if self.run_state != RunStateEnum.RUNNING and self.wait_shed_closed_task.done():  #  type: ignore[has-type]
-            self.run_state = RunStateEnum.STARTING
+        if self.run_state.run_state != RunStateEnum.RUNNING and self.wait_shed_closed_task.done():  #  type: ignore[has-type]
+            self.run_state.run_state = RunStateEnum.STARTING
             await self.report_run_state()
             self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
@@ -91,8 +91,8 @@ class LoomServer(BaseLoomServer):
         """Handle the stop command, which has no parameters."""
         await super().cmd_stop(command=command)
         self.in_cycle = False
-        if self.run_state != RunStateEnum.STOPPED and self.wait_shed_closed_task.done():
-            self.run_state = RunStateEnum.STOPPING
+        if self.run_state.run_state != RunStateEnum.STOPPED and self.wait_shed_closed_task.done():
+            self.run_state.run_state = RunStateEnum.STOPPING
             await self.report_run_state()
             self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
@@ -133,7 +133,7 @@ class LoomServer(BaseLoomServer):
         reply_data = reply_bytes[2:-1]  # skip terminator.
         new_shaft_state: ShaftStateEnum = self.shaft_state  # type: ignore[has-type]
         shed_closed = False  # False means open or unknown
-        initial_run_state = self.run_state
+        initial_run_state = self.run_state.run_state
         cycle_done = False
         match reply_code:
             case b"?":
@@ -150,9 +150,10 @@ class LoomServer(BaseLoomServer):
             case b"T":
                 # Cycle timed out. Stop weaving and restore previous state.
                 # We don't know if the shed is closed, so assume it is not.
-                new_shaft_state = ShaftStateEnum.TIMED_OUT
-                if self.run_state != RunStateEnum.STOPPED:
-                    self.run_state = RunStateEnum.STOPPING
+                if self.run_state.run_state != RunStateEnum.STOPPED:
+                    self.run_state.run_state = RunStateEnum.STOPPING
+                    self.run_state.reason = "timed out"
+                    new_shaft_state = ShaftStateEnum.WAITING_FOR_CLOSE
                 self.in_cycle = False
                 await self.restore_previous_state()
             case b"S":
@@ -161,12 +162,17 @@ class LoomServer(BaseLoomServer):
                 status_word = reply_data[0]
                 shed_closed = status_word & StatusBits.SHED_CLOSED > 0
                 is_timed_out = status_word & StatusBits.TIMED_OUT > 0
-                if self.in_cycle:
-                    new_shaft_state = ShaftStateEnum.TIMED_OUT if is_timed_out else ShaftStateEnum.RUNNING
+                if self.in_cycle and not is_timed_out:
+                    new_shaft_state = ShaftStateEnum.RUNNING
                 else:
                     new_shaft_state = (
                         ShaftStateEnum.CLOSED if shed_closed else ShaftStateEnum.WAITING_FOR_CLOSE
                     )
+                    if is_timed_out:
+                        self.run_state.run_state = (
+                            RunStateEnum.STOPPED if shed_closed else RunStateEnum.STOPPING
+                        )
+                        self.run_state.reason = "timed out"
                 if is_timed_out and shed_closed:
                     cycle_done = True
             case _:
@@ -181,11 +187,14 @@ class LoomServer(BaseLoomServer):
             self.shed_closed_event.set()
 
             # Release the solenoids and abort the cycle, if wanted.
-            if self.release_on_close or self.run_state in {RunStateEnum.STOPPING, RunStateEnum.STOPPED}:
+            if self.release_on_close or self.run_state.run_state in {
+                RunStateEnum.STOPPING,
+                RunStateEnum.STOPPED,
+            }:
                 self.in_cycle = False
                 await self.write_to_loom(b"R")
-                if self.run_state == RunStateEnum.STOPPING:
-                    self.run_state = RunStateEnum.STOPPED
+                if self.run_state.run_state == RunStateEnum.STOPPING:
+                    self.run_state.run_state = RunStateEnum.STOPPED
                 self.release_on_close = False
 
             # Send the next pick, if wanted.
@@ -193,18 +202,18 @@ class LoomServer(BaseLoomServer):
                 # Ignore this shed_closed because it's not end-of-cycle:
                 # the weaver has yet to open the shed.
                 pass
-            elif self.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
+            elif self.run_state.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
                 await self.handle_next_pick_request()
-                if self.run_state == RunStateEnum.STARTING:
-                    self.run_state = RunStateEnum.RUNNING
+                if self.run_state.run_state == RunStateEnum.STARTING:
+                    self.run_state.run_state = RunStateEnum.RUNNING
 
         if new_shaft_state != self.shaft_state:  # type: ignore[has-type]
             self.shaft_state = new_shaft_state
             await self.report_shaft_state()
 
-        if self.run_state != initial_run_state:
+        if self.run_state.run_state != initial_run_state:
             await self.report_run_state()
-            if self.run_state == RunStateEnum.STOPPING and self.wait_shed_closed_task.done():
+            if self.run_state.run_state == RunStateEnum.STOPPING and self.wait_shed_closed_task.done():
                 self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def wait_shed_closed(self) -> None:
