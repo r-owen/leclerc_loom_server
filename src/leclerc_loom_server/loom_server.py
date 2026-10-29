@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from typing import Any, TypeAlias
 
 from base_loom_server.base_loom_server import BaseLoomServer
-from base_loom_server.enums import RunStateEnum, ShaftStateEnum
+from base_loom_server.client_replies import RunState
+from base_loom_server.enums import RunStateEnum, RunStateReasonEnum, ShaftStateEnum
 from base_loom_server.utils import create_done_future
 
 from leclerc_loom_server.utils import bytes_from_shaft_word
@@ -79,8 +80,8 @@ class LoomServer(BaseLoomServer):
     ) -> None:
         """Handle the start command, which has no parameters."""
         await super().cmd_start(command=command)
-        if self.run_state.run_state != RunStateEnum.RUNNING and self.wait_shed_closed_task.done():  #  type: ignore[has-type]
-            self.run_state.run_state = RunStateEnum.STARTING
+        if self.run_state.state != RunStateEnum.RUNNING and self.wait_shed_closed_task.done():  #  type: ignore[has-type]
+            self.run_state = RunState(state=RunStateEnum.STARTING, reason=RunStateReasonEnum.NONE)
             await self.report_run_state()
             self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
@@ -91,8 +92,8 @@ class LoomServer(BaseLoomServer):
         """Handle the stop command, which has no parameters."""
         await super().cmd_stop(command=command)
         self.in_cycle = False
-        if self.run_state.run_state != RunStateEnum.STOPPED and self.wait_shed_closed_task.done():
-            self.run_state.run_state = RunStateEnum.STOPPING
+        if self.run_state.state != RunStateEnum.STOPPED and self.wait_shed_closed_task.done():
+            self.run_state = RunState(state=RunStateEnum.STOPPING, reason=RunStateReasonEnum.NONE)
             await self.report_run_state()
             self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
@@ -133,7 +134,7 @@ class LoomServer(BaseLoomServer):
         reply_data = reply_bytes[2:-1]  # skip terminator.
         new_shaft_state: ShaftStateEnum = self.shaft_state  # type: ignore[has-type]
         shed_closed = False  # False means open or unknown
-        initial_run_state = self.run_state.run_state
+        initial_run_state = self.run_state.state
         cycle_done = False
         match reply_code:
             case b"?":
@@ -150,9 +151,8 @@ class LoomServer(BaseLoomServer):
             case b"T":
                 # Cycle timed out. Stop weaving and restore previous state.
                 # We don't know if the shed is closed, so assume it is not.
-                if self.run_state.run_state != RunStateEnum.STOPPED:
-                    self.run_state.run_state = RunStateEnum.STOPPING
-                    self.run_state.reason = "timed out"
+                if self.run_state.state != RunStateEnum.STOPPED:
+                    self.run_state = RunState(state=RunStateEnum.STOPPING, reason=RunStateReasonEnum.TIMEOUT)
                     new_shaft_state = ShaftStateEnum.WAITING_FOR_CLOSE
                 self.in_cycle = False
                 await self.restore_previous_state()
@@ -169,10 +169,10 @@ class LoomServer(BaseLoomServer):
                         ShaftStateEnum.CLOSED if shed_closed else ShaftStateEnum.WAITING_FOR_CLOSE
                     )
                     if is_timed_out:
-                        self.run_state.run_state = (
-                            RunStateEnum.STOPPED if shed_closed else RunStateEnum.STOPPING
+                        self.run_state = RunState(
+                            state=RunStateEnum.STOPPED if shed_closed else RunStateEnum.STOPPING,
+                            reason=RunStateReasonEnum.TIMEOUT,
                         )
-                        self.run_state.reason = "timed out"
                 if is_timed_out and shed_closed:
                     cycle_done = True
             case _:
@@ -187,14 +187,14 @@ class LoomServer(BaseLoomServer):
             self.shed_closed_event.set()
 
             # Release the solenoids and abort the cycle, if wanted.
-            if self.release_on_close or self.run_state.run_state in {
+            if self.release_on_close or self.run_state.state in {
                 RunStateEnum.STOPPING,
                 RunStateEnum.STOPPED,
             }:
                 self.in_cycle = False
                 await self.write_to_loom(b"R")
-                if self.run_state.run_state == RunStateEnum.STOPPING:
-                    self.run_state.run_state = RunStateEnum.STOPPED
+                if self.run_state.state == RunStateEnum.STOPPING:
+                    self.run_state.state = RunStateEnum.STOPPED
                 self.release_on_close = False
 
             # Send the next pick, if wanted.
@@ -202,18 +202,18 @@ class LoomServer(BaseLoomServer):
                 # Ignore this shed_closed because it's not end-of-cycle:
                 # the weaver has yet to open the shed.
                 pass
-            elif self.run_state.run_state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
+            elif self.run_state.state in {RunStateEnum.STARTING, RunStateEnum.RUNNING}:
                 await self.handle_next_pick_request()
-                if self.run_state.run_state == RunStateEnum.STARTING:
-                    self.run_state.run_state = RunStateEnum.RUNNING
+                if self.run_state.state == RunStateEnum.STARTING:
+                    self.run_state = RunState(state=RunStateEnum.RUNNING, reason=RunStateReasonEnum.NONE)
 
         if new_shaft_state != self.shaft_state:  # type: ignore[has-type]
             self.shaft_state = new_shaft_state
             await self.report_shaft_state()
 
-        if self.run_state.run_state != initial_run_state:
+        if self.run_state.state != initial_run_state:
             await self.report_run_state()
-            if self.run_state.run_state == RunStateEnum.STOPPING and self.wait_shed_closed_task.done():
+            if self.run_state.state == RunStateEnum.STOPPING and self.wait_shed_closed_task.done():
                 self.wait_shed_closed_task = asyncio.create_task(self.wait_shed_closed())
 
     async def wait_shed_closed(self) -> None:
